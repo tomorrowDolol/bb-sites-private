@@ -1,0 +1,565 @@
+/* @meta
+{
+  "name": "senssun/user-measurements",
+  "description": "查询香山大数据平台用户测量记录",
+  "domain": "inside.senssun.com",
+  "args": {
+    "loginName": { "required": false, "description": "登录账号，通常是手机号；与 userId 二选一，推荐传 loginName" },
+    "userId": { "required": false, "description": "用户 ID；已知 userId 时可直接查询" },
+    "appId": { "required": false, "description": "指定应用 ID；默认取当前页面选择的 appId" },
+    "kind": { "required": false, "description": "记录类型：bodyfat|kitchen|length|baby|all，默认 all" },
+    "pageIndex": { "required": false, "description": "分页页码，从 0 开始，默认 0" },
+    "pageSize": { "required": false, "description": "每页条数，默认 10，最大 100" }
+  },
+  "capabilities": ["query", "measurements"],
+  "readOnly": true,
+  "example": "bb-browser site senssun/user-measurements --loginName 13180121679 --kind all --pageSize 10"
+}
+*/
+async function (args) {
+  const loginHint = "请先在当前浏览器登录香山大数据平台，再重试。目标页面通常是 http://inside.senssun.com/bigdata/index.html#/data-cloud/user-query 。";
+  const apiBaseUrl = "https://analyze.senssun.com";
+  const tokenStorageKey = "xs-token";
+  const appStorageKey = "appId";
+  const preferredAppId = "APP-ZL-202008151020";
+  const endpointMap = {
+    bodyfat: "/admin/v1/api/user/query/getFourHistory",
+    kitchen: "/admin/v1/api/user/query/getKitchenHistory",
+    length: "/admin/v1/api/user/query/getLengthHistory",
+    baby: "/admin/v1/api/user/query/getBabyHistory"
+  };
+  const kindLabelMap = {
+    bodyfat: "体脂秤测量记录",
+    kitchen: "厨房秤测量记录",
+    length: "卷尺测量记录",
+    baby: "婴儿秤测量记录"
+  };
+  const addTypeTextMap = {
+    "": "实时",
+    claim: "自动认领",
+    select: "手动认领",
+    entry: "手动录入",
+    plan: "计划新增",
+    changeAutoUser: "自动认领用户修改"
+  };
+  const sexTextMap = {
+    0: "女",
+    1: "男"
+  };
+
+  function makeError(message, extra = {}) {
+    const error = new Error(message);
+    Object.assign(error, extra);
+    return error;
+  }
+
+  function toNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function trimText(value) {
+    return String(value == null ? "" : value).trim();
+  }
+
+  function parseJson(value, fallback) {
+    if (value == null || value === "") return fallback;
+    if (typeof value === "object") return value;
+    try {
+      return JSON.parse(String(value));
+    } catch {
+      return fallback;
+    }
+  }
+
+  function filterDefinedEntries(object) {
+    return Object.entries(object || {}).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  }
+
+  function buildQueryString(query) {
+    const params = new URLSearchParams();
+    for (const [key, value] of filterDefinedEntries(query)) {
+      params.append(key, String(value));
+    }
+    return params.toString();
+  }
+
+  function buildSignaturePayload(method, query, body) {
+    if (String(method || "GET").toUpperCase() === "GET") {
+      return filterDefinedEntries(query)
+        .map(([, value]) => String(value))
+        .join("");
+    }
+    return JSON.stringify(body == null ? {} : body);
+  }
+
+  function rotateLeft(value, shift) {
+    return (value << shift) | (value >>> (32 - shift));
+  }
+
+  function addUnsigned(left, right) {
+    const leftLow = left & 0xffff;
+    const leftHigh = left >> 16;
+    const rightLow = right & 0xffff;
+    const rightHigh = right >> 16;
+    const low = leftLow + rightLow;
+    const high = leftHigh + rightHigh + (low >> 16);
+    return (high << 16) | (low & 0xffff);
+  }
+
+  function ff(a, b, c, d, x, s, ac) {
+    return addUnsigned(rotateLeft(addUnsigned(addUnsigned(a, (b & c) | (~b & d)), addUnsigned(x, ac)), s), b);
+  }
+
+  function gg(a, b, c, d, x, s, ac) {
+    return addUnsigned(rotateLeft(addUnsigned(addUnsigned(a, (b & d) | (c & ~d)), addUnsigned(x, ac)), s), b);
+  }
+
+  function hh(a, b, c, d, x, s, ac) {
+    return addUnsigned(rotateLeft(addUnsigned(addUnsigned(a, b ^ c ^ d), addUnsigned(x, ac)), s), b);
+  }
+
+  function ii(a, b, c, d, x, s, ac) {
+    return addUnsigned(rotateLeft(addUnsigned(addUnsigned(a, c ^ (b | ~d)), addUnsigned(x, ac)), s), b);
+  }
+
+  function convertToWordArray(input) {
+    const encoded = unescape(encodeURIComponent(input));
+    const length = encoded.length;
+    const wordCount = (((length + 8) >>> 6) + 1) * 16;
+    const words = new Array(wordCount).fill(0);
+
+    for (let index = 0; index < length; index += 1) {
+      words[index >> 2] |= encoded.charCodeAt(index) << ((index % 4) * 8);
+    }
+
+    words[length >> 2] |= 0x80 << ((length % 4) * 8);
+    words[wordCount - 2] = length * 8;
+    return words;
+  }
+
+  function wordToHex(value) {
+    let result = "";
+    for (let index = 0; index <= 3; index += 1) {
+      const byte = (value >>> (index * 8)) & 255;
+      result += byte.toString(16).padStart(2, "0");
+    }
+    return result;
+  }
+
+  function md5(input) {
+    const words = convertToWordArray(input);
+    let a = 0x67452301;
+    let b = 0xefcdab89;
+    let c = 0x98badcfe;
+    let d = 0x10325476;
+
+    for (let index = 0; index < words.length; index += 16) {
+      const aa = a;
+      const bb = b;
+      const cc = c;
+      const dd = d;
+
+      a = ff(a, b, c, d, words[index + 0], 7, 0xd76aa478);
+      d = ff(d, a, b, c, words[index + 1], 12, 0xe8c7b756);
+      c = ff(c, d, a, b, words[index + 2], 17, 0x242070db);
+      b = ff(b, c, d, a, words[index + 3], 22, 0xc1bdceee);
+      a = ff(a, b, c, d, words[index + 4], 7, 0xf57c0faf);
+      d = ff(d, a, b, c, words[index + 5], 12, 0x4787c62a);
+      c = ff(c, d, a, b, words[index + 6], 17, 0xa8304613);
+      b = ff(b, c, d, a, words[index + 7], 22, 0xfd469501);
+      a = ff(a, b, c, d, words[index + 8], 7, 0x698098d8);
+      d = ff(d, a, b, c, words[index + 9], 12, 0x8b44f7af);
+      c = ff(c, d, a, b, words[index + 10], 17, 0xffff5bb1);
+      b = ff(b, c, d, a, words[index + 11], 22, 0x895cd7be);
+      a = ff(a, b, c, d, words[index + 12], 7, 0x6b901122);
+      d = ff(d, a, b, c, words[index + 13], 12, 0xfd987193);
+      c = ff(c, d, a, b, words[index + 14], 17, 0xa679438e);
+      b = ff(b, c, d, a, words[index + 15], 22, 0x49b40821);
+
+      a = gg(a, b, c, d, words[index + 1], 5, 0xf61e2562);
+      d = gg(d, a, b, c, words[index + 6], 9, 0xc040b340);
+      c = gg(c, d, a, b, words[index + 11], 14, 0x265e5a51);
+      b = gg(b, c, d, a, words[index + 0], 20, 0xe9b6c7aa);
+      a = gg(a, b, c, d, words[index + 5], 5, 0xd62f105d);
+      d = gg(d, a, b, c, words[index + 10], 9, 0x02441453);
+      c = gg(c, d, a, b, words[index + 15], 14, 0xd8a1e681);
+      b = gg(b, c, d, a, words[index + 4], 20, 0xe7d3fbc8);
+      a = gg(a, b, c, d, words[index + 9], 5, 0x21e1cde6);
+      d = gg(d, a, b, c, words[index + 14], 9, 0xc33707d6);
+      c = gg(c, d, a, b, words[index + 3], 14, 0xf4d50d87);
+      b = gg(b, c, d, a, words[index + 8], 20, 0x455a14ed);
+      a = gg(a, b, c, d, words[index + 13], 5, 0xa9e3e905);
+      d = gg(d, a, b, c, words[index + 2], 9, 0xfcefa3f8);
+      c = gg(c, d, a, b, words[index + 7], 14, 0x676f02d9);
+      b = gg(b, c, d, a, words[index + 12], 20, 0x8d2a4c8a);
+
+      a = hh(a, b, c, d, words[index + 5], 4, 0xfffa3942);
+      d = hh(d, a, b, c, words[index + 8], 11, 0x8771f681);
+      c = hh(c, d, a, b, words[index + 11], 16, 0x6d9d6122);
+      b = hh(b, c, d, a, words[index + 14], 23, 0xfde5380c);
+      a = hh(a, b, c, d, words[index + 1], 4, 0xa4beea44);
+      d = hh(d, a, b, c, words[index + 4], 11, 0x4bdecfa9);
+      c = hh(c, d, a, b, words[index + 7], 16, 0xf6bb4b60);
+      b = hh(b, c, d, a, words[index + 10], 23, 0xbebfbc70);
+      a = hh(a, b, c, d, words[index + 13], 4, 0x289b7ec6);
+      d = hh(d, a, b, c, words[index + 0], 11, 0xeaa127fa);
+      c = hh(c, d, a, b, words[index + 3], 16, 0xd4ef3085);
+      b = hh(b, c, d, a, words[index + 6], 23, 0x04881d05);
+      a = hh(a, b, c, d, words[index + 9], 4, 0xd9d4d039);
+      d = hh(d, a, b, c, words[index + 12], 11, 0xe6db99e5);
+      c = hh(c, d, a, b, words[index + 15], 16, 0x1fa27cf8);
+      b = hh(b, c, d, a, words[index + 2], 23, 0xc4ac5665);
+
+      a = ii(a, b, c, d, words[index + 0], 6, 0xf4292244);
+      d = ii(d, a, b, c, words[index + 7], 10, 0x432aff97);
+      c = ii(c, d, a, b, words[index + 14], 15, 0xab9423a7);
+      b = ii(b, c, d, a, words[index + 5], 21, 0xfc93a039);
+      a = ii(a, b, c, d, words[index + 12], 6, 0x655b59c3);
+      d = ii(d, a, b, c, words[index + 3], 10, 0x8f0ccc92);
+      c = ii(c, d, a, b, words[index + 10], 15, 0xffeff47d);
+      b = ii(b, c, d, a, words[index + 1], 21, 0x85845dd1);
+      a = ii(a, b, c, d, words[index + 8], 6, 0x6fa87e4f);
+      d = ii(d, a, b, c, words[index + 15], 10, 0xfe2ce6e0);
+      c = ii(c, d, a, b, words[index + 6], 15, 0xa3014314);
+      b = ii(b, c, d, a, words[index + 13], 21, 0x4e0811a1);
+      a = ii(a, b, c, d, words[index + 4], 6, 0xf7537e82);
+      d = ii(d, a, b, c, words[index + 11], 10, 0xbd3af235);
+      c = ii(c, d, a, b, words[index + 2], 15, 0x2ad7d2bb);
+      b = ii(b, c, d, a, words[index + 9], 21, 0xeb86d391);
+
+      a = addUnsigned(a, aa);
+      b = addUnsigned(b, bb);
+      c = addUnsigned(c, cc);
+      d = addUnsigned(d, dd);
+    }
+
+    return (wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d)).toUpperCase();
+  }
+
+  function buildSign(payloadText, token, timestamp) {
+    const firstRound = md5(`${payloadText}${token}${timestamp}senssunhealth`).toUpperCase();
+    return md5(`senssuntwice${firstRound}`).toUpperCase();
+  }
+
+  async function api(path, options = {}) {
+    const method = String(options.method || "GET").toUpperCase();
+    const query = options.query || {};
+    const body = options.body;
+    const token = trimText(localStorage.getItem(tokenStorageKey));
+
+    if (!token) {
+      throw makeError("未登录香山大数据平台", {
+        status: 401,
+        code: "missing_session",
+        hint: loginHint
+      });
+    }
+
+    const timestamp = Date.now();
+    const payloadText = buildSignaturePayload(method, query, body);
+    const headers = {
+      Accept: "application/json, text/plain, */*",
+      token,
+      time: String(timestamp),
+      sign: buildSign(payloadText, token, timestamp)
+    };
+
+    let url = `${apiBaseUrl}${path}`;
+    if (method === "GET") {
+      const queryString = buildQueryString(query);
+      if (queryString) url += `?${queryString}`;
+    } else {
+      headers["Content-Type"] = "application/json;charset=UTF-8";
+    }
+
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: method === "GET" ? undefined : JSON.stringify(body == null ? {} : body)
+    });
+
+    const text = await response.text();
+    const data = parseJson(text, null);
+    if (!response.ok || !data) {
+      throw makeError(`调用香山接口失败: ${path}`, {
+        status: response.status,
+        code: "http_error",
+        hint: response.status === 401 ? loginHint : undefined,
+        data: text || null
+      });
+    }
+
+    if (data.errorCode === 402) {
+      throw makeError("登录失效，请重新登录香山大数据平台", {
+        status: 401,
+        code: "session_expired",
+        hint: loginHint,
+        data
+      });
+    }
+
+    if (data.errorCode === 301) {
+      throw makeError("香山接口返回业务拒绝", {
+        status: 400,
+        code: "business_rejected",
+        hint: data.message || undefined,
+        data
+      });
+    }
+
+    if (data.errorCode !== undefined && data.errorCode !== 0) {
+      throw makeError(data.message || `香山接口返回错误: ${path}`, {
+        status: 400,
+        code: data.errorCode,
+        data
+      });
+    }
+
+    return data;
+  }
+
+  function resolveSelectedAppId(requestedAppId, apps) {
+    const availableIds = new Set(apps.map((item) => item.appId));
+    const currentStorageAppId = trimText(localStorage.getItem(appStorageKey));
+    const candidates = [trimText(requestedAppId), currentStorageAppId, preferredAppId, apps[0]?.appId || ""];
+
+    for (const candidate of candidates) {
+      if (candidate && availableIds.has(candidate)) {
+        return {
+          appId: candidate,
+          source:
+            candidate === trimText(requestedAppId)
+              ? "arg"
+              : candidate === currentStorageAppId
+                ? "storage"
+                : candidate === preferredAppId
+                  ? "preferred_default"
+                  : "first_available"
+        };
+      }
+    }
+
+    return { appId: null, source: null };
+  }
+
+  function formatTimestamp(timestamp) {
+    const number = Number(timestamp);
+    if (!Number.isFinite(number) || number <= 0) return null;
+    return new Date(number).toISOString();
+  }
+
+  function isLikelyUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimText(value));
+  }
+
+  function calculateAge(birthday) {
+    const number = Number(birthday);
+    if (!Number.isFinite(number) || number <= 0) return null;
+    const now = new Date();
+    const birth = new Date(number);
+    let age = now.getUTCFullYear() - birth.getUTCFullYear();
+    const monthDiff = now.getUTCMonth() - birth.getUTCMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && now.getUTCDate() < birth.getUTCDate())) age -= 1;
+    return age;
+  }
+
+  function normalizeUser(user) {
+    return {
+      userId: user?.userId || null,
+      accountId: user?.accountId || null,
+      name: user?.name || null,
+      imageName: user?.imageName || null,
+      loginType: user?.loginType || null,
+      sex: user?.sex == null ? null : toNumber(user.sex),
+      sexText: sexTextMap[toNumber(user?.sex)] || null,
+      birthday: user?.birthday || null,
+      birthdayAt: formatTimestamp(user?.birthday),
+      age: calculateAge(user?.birthday),
+      height: user?.height == null ? null : toNumber(user.height),
+      weight: user?.weight == null ? null : toNumber(user.weight),
+      bmi: user?.bmi == null ? null : toNumber(user.bmi),
+      activity: user?.activity == null ? null : toNumber(user.activity),
+      userType: user?.userType == null ? null : toNumber(user.userType),
+      createTime: user?.createTime || null,
+      createTimeAt: formatTimestamp(user?.createTime),
+      updateTime: user?.updateTime || null,
+      updateTimeAt: formatTimestamp(user?.updateTime)
+    };
+  }
+
+  function normalizeMeasurement(kind, record) {
+    const rawAddType = trimText(record?.addType);
+    return {
+      kind,
+      kindText: kindLabelMap[kind] || kind,
+      ...record,
+      rawAddType,
+      addTypeText: addTypeTextMap[rawAddType] || rawAddType || "实时",
+      recordTimeAt: formatTimestamp(record?.recordTime),
+      createTimeAt: formatTimestamp(record?.createTime),
+      userInfo: parseJson(record?.userInfo, null),
+      baseInfo: parseJson(record?.baseInfo, null),
+      impedance: parseJson(record?.impedance, null),
+      eightImpedance: parseJson(record?.eightImpedance, null)
+    };
+  }
+
+  try {
+    const loginName = trimText(args.loginName);
+    const rawUserIdArg = trimText(args.userId);
+    const rawAppIdArg = trimText(args.appId);
+    const fallbackKindArg = rawUserIdArg && (rawUserIdArg.toLowerCase() === "all" || Object.prototype.hasOwnProperty.call(endpointMap, rawUserIdArg.toLowerCase()))
+      ? rawUserIdArg.toLowerCase()
+      : "";
+    const providedUserId = isLikelyUuid(rawUserIdArg) ? rawUserIdArg : "";
+    const resolvedAppIdArg = rawAppIdArg || (!providedUserId && /^APP-/i.test(rawUserIdArg) ? rawUserIdArg : "");
+    const kind = trimText(args.kind || fallbackKindArg || "all").toLowerCase();
+    const pageIndex = Math.max(0, Math.trunc(toNumber(args.pageIndex, 0)));
+    const pageSize = Math.max(1, Math.min(100, Math.trunc(toNumber(args.pageSize, 10))));
+
+    if (!loginName && !providedUserId) {
+      throw makeError("loginName 与 userId 至少需要提供一个", {
+        status: 400,
+        code: "missing_user_locator",
+        hint: "示例：bb-browser site senssun/user-measurements --loginName 13180121679"
+      });
+    }
+
+    if (kind !== "all" && !endpointMap[kind]) {
+      throw makeError("kind 参数非法", {
+        status: 400,
+        code: "invalid_kind",
+        hint: "允许值：bodyfat | kitchen | length | baby | all"
+      });
+    }
+
+    const appResponse = await api("/admin/v1/api/base/base/getAppInfo");
+    const apps = (Array.isArray(appResponse?.data) ? appResponse.data : [])
+      .map((item) => ({ appId: item?.appId || null, appName: item?.appName || null }))
+      .filter((item) => item.appId);
+
+    const selection = resolveSelectedAppId(resolvedAppIdArg, apps);
+    if (!selection.appId) {
+      throw makeError("当前账号没有可用应用，无法执行测量记录查询", {
+        status: 404,
+        code: "missing_app",
+        data: {
+          availableApps: apps,
+          requestedAppId: resolvedAppIdArg || null
+        }
+      });
+    }
+
+    let resolvedUserId = providedUserId;
+    let resolvedAccount = null;
+    let resolvedUsers = [];
+
+    if (!resolvedUserId || loginName) {
+      const accountResponse = await api("/admin/v1/api/user/query/getAccountInfo", {
+        query: {
+          appId: selection.appId,
+          loginName
+        }
+      });
+
+      const payload = accountResponse?.data || {};
+      resolvedUsers = Array.isArray(payload?.users) ? payload.users.map(normalizeUser) : [];
+      resolvedAccount = {
+        accountId: payload?.accountId || null,
+        phone: payload?.phone || null,
+        createTime: payload?.createTime || null,
+        createTimeAt: formatTimestamp(payload?.createTime),
+        lastTime: payload?.lastTime || null,
+        lastTimeAt: formatTimestamp(payload?.lastTime),
+        appVersion: payload?.appVersion || null,
+        model: payload?.model || null,
+        osVersion: payload?.osVersion || null,
+        rom: payload?.rom || null
+      };
+
+      if (!resolvedUserId) {
+        if (resolvedUsers.length === 0) {
+          throw makeError("未找到匹配用户", {
+            status: 404,
+            code: "user_not_found",
+            data: {
+              loginName,
+              appId: selection.appId
+            }
+          });
+        }
+
+        if (resolvedUsers.length > 1) {
+          throw makeError("同一账号下存在多个用户，请改用 userId 精确查询", {
+            status: 400,
+            code: "multiple_users_found",
+            data: {
+              loginName,
+              users: resolvedUsers
+            }
+          });
+        }
+
+        resolvedUserId = resolvedUsers[0].userId;
+      }
+    }
+
+    const kinds = kind === "all" ? Object.keys(endpointMap) : [kind];
+    const measurementEntries = await Promise.all(
+      kinds.map(async (currentKind) => {
+        const response = await api(endpointMap[currentKind], {
+          query: {
+            appId: selection.appId,
+            pageIndex,
+            pageSize,
+            userId: resolvedUserId
+          }
+        });
+        const data = Array.isArray(response?.data) ? response.data : [];
+        return [
+          currentKind,
+          {
+            kind: currentKind,
+            kindText: kindLabelMap[currentKind] || currentKind,
+            pageIndex,
+            pageSize,
+            count: toNumber(response?.count, data.length),
+            records: data.map((item) => normalizeMeasurement(currentKind, item))
+          }
+        ];
+      })
+    );
+
+    return {
+      fetchedAt: new Date().toISOString(),
+      query: {
+        loginName: loginName || null,
+        userId: resolvedUserId,
+        kind,
+        pageIndex,
+        pageSize
+      },
+      app: {
+        selected: {
+          appId: selection.appId,
+          appName: apps.find((item) => item.appId === selection.appId)?.appName || null,
+          source: selection.source
+        },
+        currentStorageAppId: trimText(localStorage.getItem(appStorageKey)) || null,
+        availableApps: apps
+      },
+      resolvedAccount,
+      resolvedUsers,
+      measurements: Object.fromEntries(measurementEntries)
+    };
+  } catch (error) {
+    return {
+      error: error?.message || "查询香山测量记录失败",
+      code: error?.code,
+      status: error?.status,
+      hint: error?.hint || (error?.status === 401 ? loginHint : undefined),
+      data: error?.data
+    };
+  }
+}
