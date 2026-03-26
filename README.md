@@ -49,6 +49,55 @@ bb-browser site senssun/measuring-log --errorCode 20014 --pageSize 10
 bb-browser site senssun/user-error-log --errorLogId 2c0377fd-ce6f-440e-9fcf-5c3ad0580de3
 ```
 
+## 通过 Git 多机同步
+
+本仓库只管理本地 adapter 源码：
+
+- `sites/`
+- `scripts/install-local-sites.sh`
+- `README.md`
+
+安装脚本会把 `sites/` 里的 JS 文件复制到本机的 `~/.bb-browser/sites/`。
+
+### 开发机更新 adapter
+
+1. 修改 `sites/` 下的文件
+2. 本机安装：
+
+```bash
+"./scripts/install-local-sites.sh"
+```
+
+3. 提交并推送：
+
+```bash
+git add "sites" "scripts" "README.md"
+git commit -m "feat: update adapters"
+git push
+```
+
+### 其他机器首次使用
+
+```bash
+git clone "https://github.com/tomorrowDolol/bb-sites-private.git" "baby-cli"
+cd "baby-cli"
+"./scripts/install-local-sites.sh"
+```
+
+### 其他机器后续更新
+
+```bash
+git pull
+"./scripts/install-local-sites.sh"
+```
+
+### 注意事项
+
+- 本仓库不包含 `bb-browser` 主程序，请单独安装或单独更新。
+- Git 只同步 adapter 文件，不同步浏览器登录态、Cookie、`localStorage`。
+- 换机器后，需要在目标机器浏览器重新登录相关站点。
+- 每次 `git pull` 后，都要重新执行一次安装脚本，否则 `~/.bb-browser/sites/` 不会自动更新。
+
 ## 设计原则
 
 - **KISS**：命令面直接映射站点核心能力
